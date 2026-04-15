@@ -10,13 +10,13 @@ type Curvature struct {
 }
 
 func CalculateCurvature(a Position, b Position, c Position) Curvature {
-	lengthA := a.DistanceTo(b)
-	lengthB := a.DistanceTo(c)
-	lengthC := b.DistanceTo(c)
+	lengthA := float64(a.DistanceTo(b))
+	lengthB := float64(a.DistanceTo(c))
+	lengthC := float64(b.DistanceTo(c))
 
 	sp := (lengthA + lengthB + lengthC) / 2
 
-	area := float32(m.Sqrt(float64(sp * (sp - lengthA) * (sp - lengthB) * (sp - lengthC))))
+	area := m.Sqrt(sp * (sp - lengthA) * (sp - lengthB) * (sp - lengthC))
 
 	lengthProd := lengthA * lengthB * lengthC
 	if lengthProd == 0 {
@@ -24,10 +24,10 @@ func CalculateCurvature(a Position, b Position, c Position) Curvature {
 	}
 
 	res := Curvature{Pos: b}
-	res.Curvature = float64((4 * area) / lengthProd)
+	res.Curvature = (4 * area) / lengthProd
 	radius := 1.0 / res.Curvature
 
-	num := (m.Pow(radius, 2)*2 - m.Pow(float64(lengthB), 2))
+	num := (m.Pow(radius, 2)*2 - m.Pow(lengthB, 2))
 	den := (2 * m.Pow(radius, 2))
 	res.Angle = m.Acos(num / den)
 

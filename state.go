@@ -1,11 +1,17 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strconv"
+
 	"pfeifer.dev/mapd/cereal"
 	"pfeifer.dev/mapd/cereal/car"
 	"pfeifer.dev/mapd/cereal/custom"
 	"pfeifer.dev/mapd/maps"
 	m "pfeifer.dev/mapd/math"
+	p "pfeifer.dev/mapd/params"
 	ms "pfeifer.dev/mapd/settings"
 )
 
@@ -116,4 +122,48 @@ func (s *State) Send() error {
 	output.SetWaySelectionType(s.CurrentWay.SelectionType)
 
 	return s.Publisher.Send(msg)
+}
+
+type velocityJSON struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Velocity  float64 `json:"velocity"`
+}
+
+// SendParams writes key state to /dev/shm/params/d/ so that sunnypilot Python
+// processes (map_controller.py, osm_map_data.py) can read them via mem_params.
+func (s *State) SendParams() {
+	// MapTargetVelocities — JSON array consumed by SmartCruiseControlMap
+	entries := make([]velocityJSON, 0, len(s.TargetVelocities))
+	for _, tv := range s.TargetVelocities {
+		if tv.Velocity <= 0 {
+			continue // skip zero-curvature (straight) nodes
+		}
+		entries = append(entries, velocityJSON{
+			Latitude:  float64(tv.Pos.Lat()),
+			Longitude: float64(tv.Pos.Lon()),
+			Velocity:  tv.Velocity,
+		})
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		slog.Warn("failed to marshal MapTargetVelocities", "error", err)
+	} else {
+		if err := p.PutParam(p.MAP_TARGET_VELOCITIES, data); err != nil {
+			slog.Debug("failed to write MapTargetVelocities", "error", err)
+		}
+	}
+
+	// MapSpeedLimit — current way speed limit in m/s (float string)
+	speedLimit := s.CurrentWay.MaxSpeed()
+	slStr := strconv.FormatFloat(speedLimit, 'f', -1, 64)
+	if err := p.PutParam(p.MAP_SPEED_LIMIT, []byte(slStr)); err != nil {
+		slog.Debug("failed to write MapSpeedLimit", "error", err)
+	}
+
+	// RoadName — current way display name
+	roadName := s.CurrentWay.Way.Name()
+	if err := p.PutParam(p.ROAD_NAME, []byte(fmt.Sprintf("%s", roadName))); err != nil {
+		slog.Debug("failed to write RoadName", "error", err)
+	}
 }

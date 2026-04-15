@@ -117,6 +117,7 @@ func main() {
 				slog.Debug("could not get curvatures from current state", "error", err)
 			}
 			state.TargetVelocities = GetTargetVelocities(state.Curvatures, state.TargetVelocities)
+			state.SendParams()
 		}
 
 		// send at beginning of next loop

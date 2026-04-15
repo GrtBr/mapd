@@ -13,8 +13,9 @@ import (
 )
 
 var (
-	ParamsPath string = "/data/params/d"
-	BasePath   string = GetBasePath()
+	ParamsPath    string = "/data/params/d"
+	ShmParamsPath string = "/dev/shm/params/d"
+	BasePath      string = GetBasePath()
 )
 
 func GetBaseOpPath() string {
@@ -34,6 +35,17 @@ var (
 	LAST_GPS_POSITION = ParamPath("LastGPSPosition")
 	MAPD_SETTINGS     = ParamPath("MapdSettings")
 )
+
+// Shm params (volatile, read by sunnypilot Python via mem_params = Params("/dev/shm/params"))
+var (
+	MAP_TARGET_VELOCITIES = ShmParamPath("MapTargetVelocities")
+	MAP_SPEED_LIMIT       = ShmParamPath("MapSpeedLimit")
+	ROAD_NAME             = ShmParamPath("RoadName")
+)
+
+func ShmParamPath(name string) string {
+	return filepath.Join(ShmParamsPath, name)
+}
 
 // exists returns whether the given file or directory exists
 func Exists(path string) (bool, error) {

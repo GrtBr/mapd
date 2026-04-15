@@ -9,12 +9,40 @@ import (
 	ms "pfeifer.dev/mapd/settings"
 )
 
+// minNodeSpacing is the minimum distance between consecutive nodes passed to
+// GetCurvatures. Nodes closer than this are skipped by SubsamplePositions.
+// Matches mapd_test.py MIN_NODE_SPACING = 20.0 m.
+const minNodeSpacing float32 = 20.0
+
+// SubsamplePositions returns a copy of positions where consecutive entries are
+// at least minSpacing metres apart. The first node is always kept. The last node
+// is always appended so the route endpoint is included.
+// This is the correct way to suppress 1/spacing² noise in Heron's formula:
+// skip intermediate nodes until the cumulative distance from the last kept node
+// reaches the threshold, rather than checking consecutive pairs.
+func SubsamplePositions(positions []m.Position, minSpacing float32) []m.Position {
+	if len(positions) < 2 {
+		return positions
+	}
+	sampled := make([]m.Position, 0, len(positions))
+	sampled = append(sampled, positions[0])
+	for _, p := range positions[1:] {
+		if sampled[len(sampled)-1].DistanceTo(p) >= minSpacing {
+			sampled = append(sampled, p)
+		}
+	}
+	last := positions[len(positions)-1]
+	if !sampled[len(sampled)-1].Equals(last) {
+		sampled = append(sampled, last)
+	}
+	return sampled
+}
+
 func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 	nodes := state.CurrentWay.Way.Nodes()
 	num_points := len(nodes)
 	all_nodes := [][]m.Position{nodes}
 	all_nodes_direction := []bool{state.CurrentWay.OnWay.IsForward}
-	all_nodes_is_merge_or_split := []bool{false}
 	lastWay := state.CurrentWay.Way
 	for _, nextWay := range state.NextWays {
 		nwNodes := nextWay.Way.Nodes()
@@ -23,13 +51,12 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 		}
 		all_nodes = append(all_nodes, nwNodes)
 		all_nodes_direction = append(all_nodes_direction, nextWay.IsForward)
-		all_nodes_is_merge_or_split = append(all_nodes_is_merge_or_split, lastWay.Lanes() < nextWay.Way.Lanes() || (lastWay.Lanes() > nextWay.Way.Lanes() && !lastWay.OneWay() && nextWay.Way.OneWay()))
 		lastWay = nextWay.Way
 	}
+	_ = lastWay
 
 	positions := make([]m.Position, num_points)
 
-	merge_or_split_nodes := []int{}
 	all_nodes_idx := 0
 	nodes_idx := 0
 	for i := 0; i < num_points; i++ {
@@ -46,45 +73,26 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 				index -= 1
 			}
 		}
-		node := all_nodes[all_nodes_idx][index]
-		positions[i] = node
+		positions[i] = all_nodes[all_nodes_idx][index]
 
 		nodes_idx += 1
 		if nodes_idx == len(all_nodes[all_nodes_idx]) || (nodes_idx == len(all_nodes[all_nodes_idx])-1 && all_nodes_idx > 0) {
 			all_nodes_idx += 1
 			nodes_idx = 0
-			if all_nodes_idx < len(all_nodes_is_merge_or_split) && all_nodes_is_merge_or_split[all_nodes_idx] {
-				merge_or_split_nodes = append(merge_or_split_nodes, i)
-			}
 		}
 	}
+
+	// Resample to at least minNodeSpacing between consecutive nodes.
+	// This is the correct noise-suppression approach: skip nodes until the
+	// cumulative distance from the last kept node exceeds the threshold.
+	// After resampling, merge_or_split indices into the original array are no
+	// longer valid, so that correction is omitted; GetAverageCurvatures smooths
+	// any residual spike at junction nodes.
+	positions = SubsamplePositions(positions, minNodeSpacing)
 
 	curvatures, err := GetCurvatures(positions)
 	if err != nil {
 		return []m.Curvature{}, errors.Wrap(err, "could not get curvatures from points")
-	}
-
-	// set the merge nodes to be straight to help balance out issues with map representation
-	for _, merge_or_split_node := range merge_or_split_nodes {
-		if merge_or_split_node >= 2 {
-			curvatures[merge_or_split_node-2].Curvature = 0.0015
-			curvatures[merge_or_split_node-1].Curvature = 0.0015
-		}
-		// also include nodes within 15 meters
-		for i := merge_or_split_node - 3; i >= 0; i-- {
-
-			if positions[merge_or_split_node].DistanceTo(positions[i]) > 15 {
-				break
-			}
-			curvatures[i].Curvature = 0.0015
-		}
-		// also include forward nodes within 15 meters
-		for i := merge_or_split_node; i < len(curvatures); i++ {
-			if positions[merge_or_split_node].DistanceTo(positions[i]) > 15 {
-				break
-			}
-			curvatures[i].Curvature = 0.0015
-		}
 	}
 
 	average_curvatures, err := GetAverageCurvatures(curvatures)
@@ -152,14 +160,8 @@ func GetCurvatures(positions []m.Position) (curvatures []m.Curvature, err error)
 		return []m.Curvature{}, errors.New(fmt.Sprintf("not enough points to calculate curvatures. len(points): %d", len(positions)))
 	}
 	curvatures = make([]m.Curvature, len(positions)-2)
-
 	for i := 0; i < len(positions)-2; i++ {
-		if positions[i].DistanceTo(positions[i+1]) < 10 || positions[i+1].DistanceTo(positions[i+2]) < 10 {
-			curvatures[i] = m.Curvature{Pos: positions[i+1]}
-			continue
-		}
 		curvatures[i] = m.CalculateCurvature(positions[i], positions[i+1], positions[i+2])
 	}
-
 	return curvatures, nil
 }

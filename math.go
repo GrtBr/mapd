@@ -154,7 +154,7 @@ func GetCurvatures(positions []m.Position) (curvatures []m.Curvature, err error)
 	curvatures = make([]m.Curvature, len(positions)-2)
 
 	for i := 0; i < len(positions)-2; i++ {
-		if positions[i].DistanceTo(positions[i+1]) < 30 || positions[i+1].DistanceTo(positions[i+2]) < 30 {
+		if positions[i].DistanceTo(positions[i+1]) < 10 || positions[i+1].DistanceTo(positions[i+2]) < 10 {
 			curvatures[i] = m.Curvature{Pos: positions[i+1]}
 			continue
 		}

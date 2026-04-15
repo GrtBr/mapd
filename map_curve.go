@@ -52,6 +52,9 @@ func UpdateCurveSpeed(s *State) {
 	minValidV := float32(1000)
 	for i, d := range forwardDistances {
 		tv := forwardPoints[i]
+		if tv.Velocity <= 0 {
+			continue // skip straight nodes (zero curvature)
+		}
 		if tv.Velocity > float64(s.Car.VEgo)+ms.CURVE_CALC_OFFSET {
 			continue
 		}

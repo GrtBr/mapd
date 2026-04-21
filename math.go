@@ -9,34 +9,15 @@ import (
 	ms "pfeifer.dev/mapd/settings"
 )
 
-// minNodeSpacing is the minimum distance between consecutive nodes passed to
-// GetCurvatures. Nodes closer than this are skipped by SubsamplePositions.
-// Matches mapd_test.py MIN_NODE_SPACING = 20.0 m.
-const minNodeSpacing float32 = 20.0
+// maxChordSpacing caps the outer chord length for L⁴-weighted triplets.
+// If the chord from positions[k-w] to positions[k+w] exceeds this, the width
+// is skipped and no wider widths are tried (chords only grow with w).
+// 150 m prevents a triplet spanning a junction or a long OSM gap.
+const maxChordSpacing float32 = 150.0
 
-// SubsamplePositions returns a copy of positions where consecutive entries are
-// at least minSpacing metres apart. The first node is always kept. The last node
-// is always appended so the route endpoint is included.
-// This is the correct way to suppress 1/spacing² noise in Heron's formula:
-// skip intermediate nodes until the cumulative distance from the last kept node
-// reaches the threshold, rather than checking consecutive pairs.
-func SubsamplePositions(positions []m.Position, minSpacing float32) []m.Position {
-	if len(positions) < 2 {
-		return positions
-	}
-	sampled := make([]m.Position, 0, len(positions))
-	sampled = append(sampled, positions[0])
-	for _, p := range positions[1:] {
-		if sampled[len(sampled)-1].DistanceTo(p) >= minSpacing {
-			sampled = append(sampled, p)
-		}
-	}
-	last := positions[len(positions)-1]
-	if !sampled[len(sampled)-1].Equals(last) {
-		sampled = append(sampled, last)
-	}
-	return sampled
-}
+// maxTripletWidth is the maximum half-width of the symmetric triplet.
+// Widths 1, 2, 3 are tried; each contributes weight = chord⁴.
+const maxTripletWidth int = 3
 
 func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 	nodes := state.CurrentWay.Way.Nodes()
@@ -79,14 +60,7 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 		}
 	}
 
-	// Resample to at least minNodeSpacing between consecutive nodes.
-	// This is the correct noise-suppression approach: skip nodes until the
-	// cumulative distance from the last kept node exceeds the threshold.
-	// After resampling, merge_or_split indices into the original array are no
-	// longer valid, so that correction is omitted; GetAverageCurvatures smooths
-	// any residual spike at junction nodes.
-	positions = SubsamplePositions(positions, minNodeSpacing)
-
+	// L⁴-weighted multi-scale curvature — see GetCurvatures for details.
 	curvatures, err := GetCurvatures(positions)
 	if err != nil {
 		return []m.Curvature{}, errors.Wrap(err, "could not get curvatures from points")
@@ -152,13 +126,44 @@ func GetAverageCurvatures(curvatures []m.Curvature) (average_curvatures []m.Curv
 	return average_curvatures, nil
 }
 
+// GetCurvatures computes one L⁴-weighted curvature per interior node.
+// For each node k (as the fixed middle), it tries symmetric triplets at
+// half-widths w = 1, 2, 3 using positions[k-w] and positions[k+w] as outer
+// points. Each estimate is weighted by chord(k-w, k+w)⁴ — the precision-optimal
+// (inverse-variance) weight because curvature noise scales as δ/chord².
+// A single displaced OSM node is suppressed because the wider (cleaner) triplets
+// dominate the blend. Genuine curves are preserved because all widths agree there.
+// The search stops at the first width whose chord exceeds maxChordSpacing, preventing
+// triplets from spanning junctions or large OSM gaps.
 func GetCurvatures(positions []m.Position) (curvatures []m.Curvature, err error) {
 	if len(positions) < 3 {
 		return []m.Curvature{}, errors.New(fmt.Sprintf("not enough points to calculate curvatures. len(points): %d", len(positions)))
 	}
-	curvatures = make([]m.Curvature, len(positions)-2)
-	for i := 0; i < len(positions)-2; i++ {
-		curvatures[i] = m.CalculateCurvature(positions[i], positions[i+1], positions[i+2])
+	curvatures = make([]m.Curvature, 0, len(positions))
+	for k := 1; k < len(positions)-1; k++ {
+		var totalWeight, totalCurv float64
+		var base m.Curvature
+		for w := 1; w <= maxTripletWidth; w++ {
+			i, j := k-w, k+w
+			if i < 0 || j >= len(positions) {
+				break
+			}
+			chord := float64(positions[i].DistanceTo(positions[j]))
+			if chord > float64(maxChordSpacing) {
+				break
+			}
+			c := m.CalculateCurvature(positions[i], positions[k], positions[j])
+			if w == 1 {
+				base = c // preserve Pos and ArcLength from the immediate neighbours
+			}
+			weight := chord * chord * chord * chord
+			totalWeight += weight
+			totalCurv += c.Curvature * weight
+		}
+		if totalWeight > 0 {
+			base.Curvature = totalCurv / totalWeight
+			curvatures = append(curvatures, base)
+		}
 	}
 	return curvatures, nil
 }

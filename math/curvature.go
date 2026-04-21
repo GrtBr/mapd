@@ -16,7 +16,11 @@ func CalculateCurvature(a Position, b Position, c Position) Curvature {
 
 	sp := (lengthA + lengthB + lengthC) / 2
 
-	area := m.Sqrt(sp * (sp - lengthA) * (sp - lengthB) * (sp - lengthC))
+	discriminant := sp * (sp - lengthA) * (sp - lengthB) * (sp - lengthC)
+	if discriminant < 0 {
+		discriminant = 0
+	}
+	area := m.Sqrt(discriminant)
 
 	lengthProd := lengthA * lengthB * lengthC
 	if lengthProd == 0 {

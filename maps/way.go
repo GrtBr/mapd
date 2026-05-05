@@ -134,6 +134,22 @@ func (w *Way) Nodes() []m.Position {
 	return w.nodes.Value(w._nodes)
 }
 
+func (w *Way) NodeHazardAtJunction(isForward bool) string {
+	nodes, err := w.Way.Nodes()
+	if err != nil || nodes.Len() == 0 {
+		return ""
+	}
+	idx := 0
+	if !isForward {
+		idx = nodes.Len() - 1
+	}
+	h, err := nodes.At(idx).Hazard()
+	if err != nil {
+		return ""
+	}
+	return h
+}
+
 func (w *Way) _oneWay() bool {
 	return w.Way.OneWay()
 }

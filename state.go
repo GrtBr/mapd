@@ -101,7 +101,7 @@ func (s *State) Send() error {
 	output.SetAdvisorySpeed(float32(advisorySpeed))
 
 	output.SetNextAdvisorySpeed(s.NextAdvisorySpeed.Value)
-	output.SetNextHazardDistance(s.NextAdvisorySpeed.Distance)
+	output.SetNextAdvisorySpeedDistance(s.NextAdvisorySpeed.Distance)
 
 	oneWay := s.CurrentWay.Way.OneWay()
 	output.SetOneWay(oneWay)
@@ -165,5 +165,26 @@ func (s *State) SendParams() {
 	roadName := s.CurrentWay.Way.Name()
 	if err := p.PutParam(p.ROAD_NAME, []byte(fmt.Sprintf("%s", roadName))); err != nil {
 		slog.Debug("failed to write RoadName", "error", err)
+	}
+
+	// NextMapSpeedLimit — JSON consumed by OsmMapData.get_next_speed_limit_and_distance()
+	// Written on every call (empty when no change ahead) so stale values don't linger.
+	type nextSpeedLimitJSON struct {
+		SpeedLimit float64 `json:"speedlimit"`
+		Latitude   float64 `json:"latitude"`
+		Longitude  float64 `json:"longitude"`
+	}
+	nsl := nextSpeedLimitJSON{}
+	if s.SpeedLimit.NextLimit.Value > 0 {
+		nsl = nextSpeedLimitJSON{
+			SpeedLimit: float64(s.SpeedLimit.NextLimit.Value),
+			Latitude:   float64(s.SpeedLimit.NextLimit.Position.Lat()),
+			Longitude:  float64(s.SpeedLimit.NextLimit.Position.Lon()),
+		}
+	}
+	if nslData, err := json.Marshal(nsl); err == nil {
+		if err := p.PutParam(p.NEXT_MAP_SPEED_LIMIT, nslData); err != nil {
+			slog.Debug("failed to write NextMapSpeedLimit", "error", err)
+		}
 	}
 }

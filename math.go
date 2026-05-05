@@ -19,6 +19,41 @@ const maxChordSpacing float32 = 150.0
 // Widths 1, 2, 3 are tried; each contributes weight = chord⁴.
 const maxTripletWidth int = 3
 
+// gaussSigma is the arc-length standard deviation (metres) of the Gaussian
+// kernel used to pre-smooth OSM node positions before curvature computation.
+// σ=10 m: suppresses isolated displaced nodes (they contribute ~1/5 of error
+// among neighbours at 20 m spacing) while preserving tight curves (r≥30 m
+// loses <10% curvature vs 41% at σ=25 m).
+const gaussSigma float64 = 10.0
+
+// smoothPositions returns a new slice where each position is replaced by a
+// Gaussian-weighted centroid of all positions in the way, with weights
+// decaying by arc-length distance from that node (σ=gaussSigma).
+// This suppresses isolated OSM node positioning errors before curvature is computed.
+func smoothPositions(positions []m.Position) []m.Position {
+	n := len(positions)
+	out := make([]m.Position, n)
+
+	arcLen := make([]float64, n)
+	for i := 1; i < n; i++ {
+		arcLen[i] = arcLen[i-1] + float64(positions[i-1].DistanceTo(positions[i]))
+	}
+
+	inv2sig2 := 1.0 / (2.0 * gaussSigma * gaussSigma)
+	for k := 0; k < n; k++ {
+		var wLat, wLon, wSum float64
+		for i := 0; i < n; i++ {
+			d := arcLen[k] - arcLen[i]
+			w := math.Exp(-d * d * inv2sig2)
+			wLat += positions[i].Lat() * w
+			wLon += positions[i].Lon() * w
+			wSum += w
+		}
+		out[k] = m.NewPosition(wLat/wSum, wLon/wSum)
+	}
+	return out
+}
+
 func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 	nodes := state.CurrentWay.Way.Nodes()
 	num_points := len(nodes)
@@ -139,6 +174,7 @@ func GetCurvatures(positions []m.Position) (curvatures []m.Curvature, err error)
 	if len(positions) < 3 {
 		return []m.Curvature{}, errors.New(fmt.Sprintf("not enough points to calculate curvatures. len(points): %d", len(positions)))
 	}
+	positions = smoothPositions(positions)
 	curvatures = make([]m.Curvature, 0, len(positions))
 	for k := 1; k < len(positions)-1; k++ {
 		var totalWeight, totalCurv float64

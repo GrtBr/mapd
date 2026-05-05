@@ -236,12 +236,12 @@ type Coordinates capnp.Struct
 const Coordinates_TypeID = 0x922b57c60c6a46d1
 
 func NewCoordinates(s *capnp.Segment) (Coordinates, error) {
-	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0})
+	st, err := capnp.NewStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 1})
 	return Coordinates(st), err
 }
 
 func NewRootCoordinates(s *capnp.Segment) (Coordinates, error) {
-	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0})
+	st, err := capnp.NewRootStruct(s, capnp.ObjectSize{DataSize: 16, PointerCount: 1})
 	return Coordinates(st), err
 }
 
@@ -293,12 +293,30 @@ func (s Coordinates) SetLongitude(v float64) {
 	capnp.Struct(s).SetUint64(8, math.Float64bits(v))
 }
 
+func (s Coordinates) Hazard() (string, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.Text(), err
+}
+
+func (s Coordinates) HasHazard() bool {
+	return capnp.Struct(s).HasPtr(0)
+}
+
+func (s Coordinates) HazardBytes() ([]byte, error) {
+	p, err := capnp.Struct(s).Ptr(0)
+	return p.TextBytes(), err
+}
+
+func (s Coordinates) SetHazard(v string) error {
+	return capnp.Struct(s).SetText(0, v)
+}
+
 // Coordinates_List is a list of Coordinates.
 type Coordinates_List = capnp.StructList[Coordinates]
 
 // NewCoordinates creates a new list of Coordinates.
 func NewCoordinates_List(s *capnp.Segment, sz int32) (Coordinates_List, error) {
-	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 16, PointerCount: 0}, sz)
+	l, err := capnp.NewCompositeList(s, capnp.ObjectSize{DataSize: 16, PointerCount: 1}, sz)
 	return capnp.StructList[Coordinates](l), err
 }
 

@@ -40,6 +40,7 @@ var (
 var (
 	MAP_TARGET_VELOCITIES = ShmParamPath("MapTargetVelocities")
 	MAP_SPEED_LIMIT       = ShmParamPath("MapSpeedLimit")
+	NEXT_MAP_SPEED_LIMIT  = ShmParamPath("NextMapSpeedLimit")
 	ROAD_NAME             = ShmParamPath("RoadName")
 )
 

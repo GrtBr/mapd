@@ -23,6 +23,7 @@ import (
 type TmpNode struct {
 	Latitude  float64
 	Longitude float64
+	Hazard    string
 }
 type TmpWay struct {
 	Name             string
@@ -123,52 +124,57 @@ func GenerateOffline(s OfflineSettings) {
 	allMaxLat := float64(-90)
 	allMaxLon := float64(-180)
 
+	// taggedNodes collects OSM node IDs that carry hazard-relevant tags (highway=stop, etc.).
+	// OSM PBF format guarantees all node blobs precede way blobs, so single-pass collection works.
+	taggedNodes := make(map[osm.NodeID]string)
+
 	slog.Info("Scanning Ways")
 	for scanner.Scan() {
-		var way *osm.Way
-		switch o := scanner.Object(); o.(type) {
+		switch o := scanner.Object(); o := o.(type) {
+		case *osm.Node:
+			if h := extractNodeHazard(o); h != "" {
+				taggedNodes[o.ID] = h
+			}
 		case *osm.Way:
-			way = o.(*osm.Way)
-		default:
-			way = nil
-		}
-		if way != nil && len(way.Nodes) > 1 {
-			tags := way.TagMap()
-			lanes, _ := strconv.ParseUint(tags["lanes"], 10, 8)
-			tmpWay := TmpWay{
-				Nodes:            make([]TmpNode, len(way.Nodes)),
-				Name:             tags["name"],
-				Ref:              tags["ref"],
-				Hazard:           tags["hazard"],
-				MaxSpeed:         ParseMaxSpeed(tags["maxspeed"]),
-				MaxSpeedForward:  ParseMaxSpeed(tags["maxspeed:forward"]),
-				MaxSpeedBackward: ParseMaxSpeed(tags["maxspeed:backward"]),
-				MaxSpeedAdvisory: ParseMaxSpeed(tags["maxspeed:advisory"]),
-				Lanes:            uint8(lanes),
-				OneWay:           tags["oneway"] == "yes",
-			}
-			index++
+			way := o
+			if len(way.Nodes) > 1 {
+				tags := way.TagMap()
+				lanes, _ := strconv.ParseUint(tags["lanes"], 10, 8)
+				tmpWay := TmpWay{
+					Nodes:            make([]TmpNode, len(way.Nodes)),
+					Name:             tags["name"],
+					Ref:              tags["ref"],
+					Hazard:           tags["hazard"],
+					MaxSpeed:         ParseMaxSpeed(tags["maxspeed"]),
+					MaxSpeedForward:  ParseMaxSpeed(tags["maxspeed:forward"]),
+					MaxSpeedBackward: ParseMaxSpeed(tags["maxspeed:backward"]),
+					MaxSpeedAdvisory: ParseMaxSpeed(tags["maxspeed:advisory"]),
+					Lanes:            uint8(lanes),
+					OneWay:           tags["oneway"] == "yes",
+				}
+				index++
 
-			minLat := float64(90)
-			minLon := float64(180)
-			maxLat := float64(-90)
-			maxLon := float64(-180)
-			for i, n := range way.Nodes {
-				if n.Lat < minLat {
-					minLat = n.Lat
+				minLat := float64(90)
+				minLon := float64(180)
+				maxLat := float64(-90)
+				maxLon := float64(-180)
+				for i, n := range way.Nodes {
+					if n.Lat < minLat {
+						minLat = n.Lat
+					}
+					if n.Lon < minLon {
+						minLon = n.Lon
+					}
+					if n.Lat > maxLat {
+						maxLat = n.Lat
+					}
+					if n.Lon > maxLon {
+						maxLon = n.Lon
+					}
+					tmpWay.Nodes[i].Latitude = n.Lat
+					tmpWay.Nodes[i].Longitude = n.Lon
+					tmpWay.Nodes[i].Hazard = taggedNodes[n.ID]
 				}
-				if n.Lon < minLon {
-					minLon = n.Lon
-				}
-				if n.Lat > maxLat {
-					maxLat = n.Lat
-				}
-				if n.Lon > maxLon {
-					maxLon = n.Lon
-				}
-				tmpWay.Nodes[i].Latitude = n.Lat
-				tmpWay.Nodes[i].Longitude = n.Lon
-			}
 			tmpWay.Box.MinPos = m.NewPosition(minLat, minLon)
 			tmpWay.Box.MaxPos = m.NewPosition(maxLat, maxLon)
 			if minLat < allMinLat {
@@ -185,6 +191,7 @@ func GenerateOffline(s OfflineSettings) {
 			}
 			scannedWays = append(scannedWays, tmpWay)
 		}
+	}
 	}
 
 	slog.Info("Finding Bounds")
@@ -266,6 +273,11 @@ func GenerateOffline(s OfflineSettings) {
 				n := nodes.At(j)
 				n.SetLatitude(node.Latitude)
 				n.SetLongitude(node.Longitude)
+				if node.Hazard != "" {
+					if err := n.SetHazard(node.Hazard); err != nil {
+						slog.Error("could not set node hazard", "error", err)
+					}
+				}
 			}
 		}
 
@@ -366,4 +378,42 @@ func ParseMaxSpeed(maxspeed string) float64 {
 	}
 
 	return 0
+}
+
+// extractNodeHazard returns a hazard tag string for OSM nodes that require
+// speed reduction: stop signs, give-way, crossings, traffic calming, etc.
+// Returns "" if the node has no recognised hazard tag.
+func extractNodeHazard(node *osm.Node) string {
+	tags := node.Tags
+	switch tags.Find("highway") {
+	case "stop":
+		return "stop"
+	case "give_way":
+		return "give_way"
+	case "turning_circle":
+		return "turning_circle"
+	case "mini_roundabout":
+		return "mini_roundabout"
+	}
+	if tags.Find("junction") == "roundabout" {
+		return "roundabout"
+	}
+	if tags.Find("barrier") == "toll_booth" {
+		return "toll_booth"
+	}
+	switch tags.Find("railway") {
+	case "level_crossing":
+		return "level_crossing"
+	case "railway_crossing":
+		return "railway_crossing"
+	}
+	tc := tags.Find("traffic_calming")
+	if tc != "" {
+		switch tc {
+		case "painted_island", "surface", "marking":
+			return ""
+		}
+		return "traffic_calming"
+	}
+	return ""
 }

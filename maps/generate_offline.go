@@ -170,9 +170,24 @@ func GenerateOffline(s OfflineSettings) {
 	}
 	defer file.Close()
 
+	// nodeCollectionBox is the processing bbox extended by 1° on every side.
+	// We only decode and store coordinates for nodes within this box.
+	// 1° of padding ensures nodes belonging to ways that cross the strip
+	// boundary are still resolved correctly.
+	const nodeCollectPadDeg = 1.0
+	nodeCollectionBox := s.Box.Overlap(nodeCollectPadDeg)
+
 	// Limit to 2 parallel decoders to reduce peak decode-buffer memory.
 	scanner := osmpbf.New(context.Background(), file, 2)
 	scanner.SkipRelations = true
+	// FilterNode runs inside the decoder goroutines BEFORE an osm.Node is
+	// allocated on the heap. When it returns false the library reuses the
+	// node struct (no allocation). This is the key to keeping memory bounded:
+	// the SA PBF has ~250M nodes; without this filter every node is allocated
+	// (~250 bytes each) faster than the GC can reclaim them → 14 GB OOM.
+	scanner.FilterNode = func(n *osm.Node) bool {
+		return nodeCollectionBox.PosInside(m.NewPosition(n.Lat, n.Lon))
+	}
 	defer scanner.Close()
 
 	areas := generateAreas()
@@ -186,16 +201,6 @@ func GenerateOffline(s OfflineSettings) {
 			relevantAreas = append(relevantAreas, &areas[i])
 		}
 	}
-
-	// nodeCollectionBox is the processing bbox extended by 1° on every side.
-	// We only store coordinates for nodes that fall within this box, which
-	// limits nodeCoords to the fraction of the planet's nodes that are
-	// relevant to the current generation run. For a SA quarter-strip this
-	// keeps nodeCoords under ~1.5 GB instead of the ~4 GB needed for all
-	// 250 M SA nodes.  1° of padding ensures that nodes belonging to ways
-	// that cross the strip boundary are still resolved correctly.
-	const nodeCollectPadDeg = 1.0
-	nodeCollectionBox := s.Box.Overlap(nodeCollectPadDeg)
 
 	// taggedNodes collects OSM node IDs that carry hazard-relevant tags.
 	// nodeCoords is a compact sorted slice used to resolve way-node coordinates.

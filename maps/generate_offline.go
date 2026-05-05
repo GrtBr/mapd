@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -24,6 +25,15 @@ type TmpNode struct {
 	Latitude  float64
 	Longitude float64
 	Hazard    string
+}
+
+// nodeCoordEntry is a compact node coordinate record used during tile generation.
+// Using float32 and a sorted slice instead of map[NodeID][2]float64 reduces peak
+// RSS from ~7.8 GB to ~640 MB for the 40 M-node SA extract.
+type nodeCoordEntry struct {
+	id  int64
+	lat float32
+	lon float32
 }
 type TmpWay struct {
 	Name             string
@@ -129,11 +139,14 @@ func GenerateOffline(s OfflineSettings) {
 	}
 
 	// taggedNodes collects OSM node IDs that carry hazard-relevant tags (highway=stop, etc.).
-	// nodeCoords caches every node's lat/lon so way-node coordinates can be resolved in
-	// the same pass. Standard OSM PBF (e.g. Geofabrik) does not embed coordinates in ways,
+	// nodeCoords is a compact sorted slice (sorted by node ID) used to resolve way-node
+	// coordinates. Standard OSM PBF (e.g. Geofabrik) does not embed coordinates in ways,
 	// so this lookup is required. OSM PBF guarantees node blobs precede way blobs.
+	// A slice is used instead of map[NodeID][2]float64 to avoid Go map evacuation overhead
+	// which peaks at ~7.8 GB RSS for the 40 M-node SA extract.
 	taggedNodes := make(map[osm.NodeID]string)
-	nodeCoords := make(map[osm.NodeID][2]float64)
+	nodeCoords := make([]nodeCoordEntry, 0, 50_000_000)
+	nodeCoordsSorted := false
 
 	slog.Info("Scanning Ways")
 	for scanner.Scan() {
@@ -142,8 +155,12 @@ func GenerateOffline(s OfflineSettings) {
 			if h := extractNodeHazard(o); h != "" {
 				taggedNodes[o.ID] = h
 			}
-			nodeCoords[o.ID] = [2]float64{o.Lat, o.Lon}
+			nodeCoords = append(nodeCoords, nodeCoordEntry{id: int64(o.ID), lat: float32(o.Lat), lon: float32(o.Lon)})
 		case *osm.Way:
+			if !nodeCoordsSorted {
+				sort.Slice(nodeCoords, func(i, j int) bool { return nodeCoords[i].id < nodeCoords[j].id })
+				nodeCoordsSorted = true
+			}
 			way := o
 			if len(way.Nodes) > 1 {
 				tags := way.TagMap()
@@ -166,8 +183,7 @@ func GenerateOffline(s OfflineSettings) {
 				maxLat := float64(-90)
 				maxLon := float64(-180)
 				for i, n := range way.Nodes {
-					lat := nodeCoords[n.ID][0]
-					lon := nodeCoords[n.ID][1]
+					lat, lon := lookupNodeCoord(nodeCoords, int64(n.ID))
 					if lat < minLat {
 						minLat = lat
 					}
@@ -373,6 +389,16 @@ func ParseMaxSpeed(maxspeed string) float64 {
 	}
 
 	return 0
+}
+
+// lookupNodeCoord binary-searches the sorted nodeCoords slice for a node ID and
+// returns its lat/lon as float64. Returns (0, 0) if the node is not found.
+func lookupNodeCoord(coords []nodeCoordEntry, id int64) (float64, float64) {
+	idx := sort.Search(len(coords), func(i int) bool { return coords[i].id >= id })
+	if idx < len(coords) && coords[idx].id == id {
+		return float64(coords[idx].lat), float64(coords[idx].lon)
+	}
+	return 0, 0
 }
 
 // extractNodeHazard returns a hazard tag string for OSM nodes that require

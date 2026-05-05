@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,10 +20,60 @@ import (
 	"pfeifer.dev/mapd/utils"
 )
 
+// hazardIndex is a compact 1-byte representation of OSM node hazard tags.
+// Using uint8 instead of string saves 15 bytes per node; for SA's ~150 M way
+// nodes that's ~2.25 GB saved vs the string approach.
+type hazardIndex uint8
+
+const (
+	hazardNone           hazardIndex = 0
+	hazardStop           hazardIndex = 1
+	hazardGiveWay        hazardIndex = 2
+	hazardRoundabout     hazardIndex = 3
+	hazardMiniRoundabout hazardIndex = 4
+	hazardTurningCircle  hazardIndex = 5
+	hazardTollBooth      hazardIndex = 6
+	hazardLevelCrossing  hazardIndex = 7
+	hazardRailwayCrossing hazardIndex = 8
+	hazardTrafficCalming hazardIndex = 9
+)
+
+func hazardIndexFromString(s string) hazardIndex {
+	switch s {
+	case "stop":             return hazardStop
+	case "give_way":         return hazardGiveWay
+	case "roundabout":       return hazardRoundabout
+	case "mini_roundabout":  return hazardMiniRoundabout
+	case "turning_circle":   return hazardTurningCircle
+	case "toll_booth":       return hazardTollBooth
+	case "level_crossing":   return hazardLevelCrossing
+	case "railway_crossing": return hazardRailwayCrossing
+	case "traffic_calming":  return hazardTrafficCalming
+	}
+	return hazardNone
+}
+
+func (h hazardIndex) String() string {
+	switch h {
+	case hazardStop:             return "stop"
+	case hazardGiveWay:          return "give_way"
+	case hazardRoundabout:       return "roundabout"
+	case hazardMiniRoundabout:   return "mini_roundabout"
+	case hazardTurningCircle:    return "turning_circle"
+	case hazardTollBooth:        return "toll_booth"
+	case hazardLevelCrossing:    return "level_crossing"
+	case hazardRailwayCrossing:  return "railway_crossing"
+	case hazardTrafficCalming:   return "traffic_calming"
+	}
+	return ""
+}
+
+// TmpNode uses float32 lat/lon (saves 8 bytes vs float64) and hazardIndex
+// (saves 15 bytes vs string). Total: 9 bytes vs 32 bytes — 72% smaller.
 type TmpNode struct {
-	Latitude  float64
-	Longitude float64
-	Hazard    string
+	Latitude  float32
+	Longitude float32
+	Hazard    hazardIndex
 }
 
 // nodeCoordEntry is a compact node coordinate record used during tile generation.
@@ -121,8 +170,8 @@ func GenerateOffline(s OfflineSettings) {
 	}
 	defer file.Close()
 
-	// The third parameter is the number of parallel decoders to use.
-	scanner := osmpbf.New(context.Background(), file, runtime.GOMAXPROCS(-1))
+	// Limit to 2 parallel decoders to reduce peak decode-buffer memory.
+	scanner := osmpbf.New(context.Background(), file, 2)
 	scanner.SkipRelations = true
 	defer scanner.Close()
 
@@ -138,20 +187,29 @@ func GenerateOffline(s OfflineSettings) {
 		}
 	}
 
-	// taggedNodes collects OSM node IDs that carry hazard-relevant tags (highway=stop, etc.).
-	// nodeCoords is a compact sorted slice (sorted by node ID) used to resolve way-node
-	// coordinates. Standard OSM PBF (e.g. Geofabrik) does not embed coordinates in ways,
-	// so this lookup is required. OSM PBF guarantees node blobs precede way blobs.
-	// A slice is used instead of map[NodeID][2]float64 to avoid Go map evacuation overhead
-	// which peaks at ~7.8 GB RSS for the 40 M-node SA extract.
+	// nodeCollectionBox is the processing bbox extended by 1° on every side.
+	// We only store coordinates for nodes that fall within this box, which
+	// limits nodeCoords to the fraction of the planet's nodes that are
+	// relevant to the current generation run. For a SA quarter-strip this
+	// keeps nodeCoords under ~1.5 GB instead of the ~4 GB needed for all
+	// 250 M SA nodes.  1° of padding ensures that nodes belonging to ways
+	// that cross the strip boundary are still resolved correctly.
+	const nodeCollectPadDeg = 1.0
+	nodeCollectionBox := s.Box.Overlap(nodeCollectPadDeg)
+
+	// taggedNodes collects OSM node IDs that carry hazard-relevant tags.
+	// nodeCoords is a compact sorted slice used to resolve way-node coordinates.
 	taggedNodes := make(map[osm.NodeID]string)
-	nodeCoords := make([]nodeCoordEntry, 0, 50_000_000)
+	nodeCoords := make([]nodeCoordEntry, 0)
 	nodeCoordsSorted := false
 
 	slog.Info("Scanning Ways")
 	for scanner.Scan() {
 		switch o := scanner.Object(); o := o.(type) {
 		case *osm.Node:
+			if !nodeCollectionBox.PosInside(m.NewPosition(o.Lat, o.Lon)) {
+				continue
+			}
 			if h := extractNodeHazard(o); h != "" {
 				taggedNodes[o.ID] = h
 			}
@@ -178,30 +236,30 @@ func GenerateOffline(s OfflineSettings) {
 					OneWay:           tags["oneway"] == "yes",
 				}
 
-				minLat := float64(90)
-				minLon := float64(180)
-				maxLat := float64(-90)
-				maxLon := float64(-180)
+				minLat := float32(90)
+				minLon := float32(180)
+				maxLat := float32(-90)
+				maxLon := float32(-180)
 				for i, n := range way.Nodes {
-					lat, lon := lookupNodeCoord(nodeCoords, int64(n.ID))
-					if lat < minLat {
-						minLat = lat
+					lat32, lon32 := lookupNodeCoord(nodeCoords, int64(n.ID))
+					if lat32 < minLat {
+						minLat = lat32
 					}
-					if lon < minLon {
-						minLon = lon
+					if lon32 < minLon {
+						minLon = lon32
 					}
-					if lat > maxLat {
-						maxLat = lat
+					if lat32 > maxLat {
+						maxLat = lat32
 					}
-					if lon > maxLon {
-						maxLon = lon
+					if lon32 > maxLon {
+						maxLon = lon32
 					}
-					tmpWay.Nodes[i].Latitude = lat
-					tmpWay.Nodes[i].Longitude = lon
-					tmpWay.Nodes[i].Hazard = taggedNodes[n.ID]
+					tmpWay.Nodes[i].Latitude = lat32
+					tmpWay.Nodes[i].Longitude = lon32
+					tmpWay.Nodes[i].Hazard = hazardIndexFromString(taggedNodes[n.ID])
 				}
-				tmpWay.Box.MinPos = m.NewPosition(minLat, minLon)
-				tmpWay.Box.MaxPos = m.NewPosition(maxLat, maxLon)
+				tmpWay.Box.MinPos = m.NewPosition(float64(minLat), float64(minLon))
+				tmpWay.Box.MaxPos = m.NewPosition(float64(maxLat), float64(maxLon))
 
 				// Distribute directly to matching areas — no global buffer needed.
 				for _, area := range relevantAreas {
@@ -282,10 +340,10 @@ func GenerateOffline(s OfflineSettings) {
 			}
 			for j, node := range way.Nodes {
 				n := nodes.At(j)
-				n.SetLatitude(node.Latitude)
-				n.SetLongitude(node.Longitude)
-				if node.Hazard != "" {
-					if err := n.SetHazard(node.Hazard); err != nil {
+				n.SetLatitude(float64(node.Latitude))
+				n.SetLongitude(float64(node.Longitude))
+				if node.Hazard != hazardNone {
+					if err := n.SetHazard(node.Hazard.String()); err != nil {
 						slog.Error("could not set node hazard", "error", err)
 					}
 				}
@@ -392,11 +450,11 @@ func ParseMaxSpeed(maxspeed string) float64 {
 }
 
 // lookupNodeCoord binary-searches the sorted nodeCoords slice for a node ID and
-// returns its lat/lon as float64. Returns (0, 0) if the node is not found.
-func lookupNodeCoord(coords []nodeCoordEntry, id int64) (float64, float64) {
+// returns its lat/lon as float32. Returns (0, 0) if the node is not found.
+func lookupNodeCoord(coords []nodeCoordEntry, id int64) (float32, float32) {
 	idx := sort.Search(len(coords), func(i int) bool { return coords[i].id >= id })
 	if idx < len(coords) && coords[idx].id == id {
-		return float64(coords[idx].lat), float64(coords[idx].lon)
+		return coords[idx].lat, coords[idx].lon
 	}
 	return 0, 0
 }

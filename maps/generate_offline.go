@@ -129,8 +129,11 @@ func GenerateOffline(s OfflineSettings) {
 	}
 
 	// taggedNodes collects OSM node IDs that carry hazard-relevant tags (highway=stop, etc.).
-	// OSM PBF format guarantees all node blobs precede way blobs, so single-pass collection works.
+	// nodeCoords caches every node's lat/lon so way-node coordinates can be resolved in
+	// the same pass. Standard OSM PBF (e.g. Geofabrik) does not embed coordinates in ways,
+	// so this lookup is required. OSM PBF guarantees node blobs precede way blobs.
 	taggedNodes := make(map[osm.NodeID]string)
+	nodeCoords := make(map[osm.NodeID][2]float64)
 
 	slog.Info("Scanning Ways")
 	for scanner.Scan() {
@@ -139,6 +142,7 @@ func GenerateOffline(s OfflineSettings) {
 			if h := extractNodeHazard(o); h != "" {
 				taggedNodes[o.ID] = h
 			}
+			nodeCoords[o.ID] = [2]float64{o.Lat, o.Lon}
 		case *osm.Way:
 			way := o
 			if len(way.Nodes) > 1 {
@@ -162,20 +166,22 @@ func GenerateOffline(s OfflineSettings) {
 				maxLat := float64(-90)
 				maxLon := float64(-180)
 				for i, n := range way.Nodes {
-					if n.Lat < minLat {
-						minLat = n.Lat
+					lat := nodeCoords[n.ID][0]
+					lon := nodeCoords[n.ID][1]
+					if lat < minLat {
+						minLat = lat
 					}
-					if n.Lon < minLon {
-						minLon = n.Lon
+					if lon < minLon {
+						minLon = lon
 					}
-					if n.Lat > maxLat {
-						maxLat = n.Lat
+					if lat > maxLat {
+						maxLat = lat
 					}
-					if n.Lon > maxLon {
-						maxLon = n.Lon
+					if lon > maxLon {
+						maxLon = lon
 					}
-					tmpWay.Nodes[i].Latitude = n.Lat
-					tmpWay.Nodes[i].Longitude = n.Lon
+					tmpWay.Nodes[i].Latitude = lat
+					tmpWay.Nodes[i].Longitude = lon
 					tmpWay.Nodes[i].Hazard = taggedNodes[n.ID]
 				}
 				tmpWay.Box.MinPos = m.NewPosition(minLat, minLon)
@@ -190,6 +196,8 @@ func GenerateOffline(s OfflineSettings) {
 			}
 		}
 	}
+
+	nodeCoords = nil // free node coordinate cache before write phase
 
 	slog.Info("Finding Bounds")
 	for _, area := range areas {

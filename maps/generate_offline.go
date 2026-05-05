@@ -104,7 +104,7 @@ func generateAreas() []Area {
 func GenerateOffline(s OfflineSettings) {
 	slog.Info("Generating Offline Map")
 	EnsureOfflineMapsDirectories(s)
-	file, err := os.Open("./map.osm.pbf")
+	file, err := os.Open(s.InputFile)
 	if err != nil {
 		slog.Error("could not open map pbf file", "error", err)
 		panic("failed to read maps, exiting")
@@ -116,13 +116,17 @@ func GenerateOffline(s OfflineSettings) {
 	scanner.SkipRelations = true
 	defer scanner.Close()
 
-	scannedWays := []TmpWay{}
 	areas := generateAreas()
-	index := 0
-	allMinLat := float64(90)
-	allMinLon := float64(180)
-	allMaxLat := float64(-90)
-	allMaxLon := float64(-180)
+
+	// Pre-filter to only areas within the output bbox so we don't distribute every way
+	// against all 260K+ global areas during the scan pass.
+	overlapBox := s.Box.Overlap(s.Overlap)
+	relevantAreas := make([]*Area, 0, 512)
+	for i := range areas {
+		if overlapBox.Overlapping(areas[i].Box) {
+			relevantAreas = append(relevantAreas, &areas[i])
+		}
+	}
 
 	// taggedNodes collects OSM node IDs that carry hazard-relevant tags (highway=stop, etc.).
 	// OSM PBF format guarantees all node blobs precede way blobs, so single-pass collection works.
@@ -152,7 +156,6 @@ func GenerateOffline(s OfflineSettings) {
 					Lanes:            uint8(lanes),
 					OneWay:           tags["oneway"] == "yes",
 				}
-				index++
 
 				minLat := float64(90)
 				minLon := float64(180)
@@ -175,34 +178,26 @@ func GenerateOffline(s OfflineSettings) {
 					tmpWay.Nodes[i].Longitude = n.Lon
 					tmpWay.Nodes[i].Hazard = taggedNodes[n.ID]
 				}
-			tmpWay.Box.MinPos = m.NewPosition(minLat, minLon)
-			tmpWay.Box.MaxPos = m.NewPosition(maxLat, maxLon)
-			if minLat < allMinLat {
-				allMinLat = minLat
+				tmpWay.Box.MinPos = m.NewPosition(minLat, minLon)
+				tmpWay.Box.MaxPos = m.NewPosition(maxLat, maxLon)
+
+				// Distribute directly to matching areas — no global buffer needed.
+				for _, area := range relevantAreas {
+					if tmpWay.Box.Overlapping(area.OverlapBox(s.Overlap)) {
+						area.Ways = append(area.Ways, tmpWay)
+					}
+				}
 			}
-			if minLon < allMinLon {
-				allMinLon = minLon
-			}
-			if maxLat > allMaxLat {
-				allMaxLat = maxLat
-			}
-			if maxLon > allMaxLon {
-				allMaxLon = maxLon
-			}
-			scannedWays = append(scannedWays, tmpWay)
 		}
-	}
 	}
 
 	slog.Info("Finding Bounds")
 	for _, area := range areas {
-		overlapBox := s.Box.Overlap(s.Overlap)
 		if !overlapBox.Contains(area.Box) {
 			continue
 		}
 
-		haveWays := overlapBox.Overlapping(area.Box)
-		if !haveWays && !s.GenerateEmptyFiles {
+		if len(area.Ways) == 0 && !s.GenerateEmptyFiles {
 			continue
 		}
 
@@ -216,14 +211,6 @@ func GenerateOffline(s OfflineSettings) {
 		if err != nil {
 			slog.Error("could not create capnp root for offline data", "error", err)
 			panic("unexpected capnp error, exiting")
-		}
-
-		for _, way := range scannedWays {
-
-			overlaps := way.Box.Overlapping(area.OverlapBox(s.Overlap))
-			if overlaps {
-				area.Ways = append(area.Ways, way)
-			}
 		}
 
 		slog.Info("Writing Area")

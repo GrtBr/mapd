@@ -163,37 +163,14 @@ func generateAreas() []Area {
 func GenerateOffline(s OfflineSettings) {
 	slog.Info("Generating Offline Map")
 	EnsureOfflineMapsDirectories(s)
-	file, err := os.Open(s.InputFile)
-	if err != nil {
-		slog.Error("could not open map pbf file", "error", err)
-		panic("failed to read maps, exiting")
-	}
-	defer file.Close()
 
 	// nodeCollectionBox is the processing bbox extended by 1° on every side.
-	// We only decode and store coordinates for nodes within this box.
-	// 1° of padding ensures nodes belonging to ways that cross the strip
-	// boundary are still resolved correctly.
+	// 1° of padding ensures nodes belonging to ways that straddle the bbox
+	// boundary are still resolved correctly in pass 2.
 	const nodeCollectPadDeg = 1.0
 	nodeCollectionBox := s.Box.Overlap(nodeCollectPadDeg)
 
-	// Limit to 2 parallel decoders to reduce peak decode-buffer memory.
-	scanner := osmpbf.New(context.Background(), file, 2)
-	scanner.SkipRelations = true
-	// FilterNode runs inside the decoder goroutines BEFORE an osm.Node is
-	// allocated on the heap. When it returns false the library reuses the
-	// node struct (no allocation). This is the key to keeping memory bounded:
-	// the SA PBF has ~250M nodes; without this filter every node is allocated
-	// (~250 bytes each) faster than the GC can reclaim them → 14 GB OOM.
-	scanner.FilterNode = func(n *osm.Node) bool {
-		return nodeCollectionBox.PosInside(m.NewPosition(n.Lat, n.Lon))
-	}
-	defer scanner.Close()
-
 	areas := generateAreas()
-
-	// Pre-filter to only areas within the output bbox so we don't distribute every way
-	// against all 260K+ global areas during the scan pass.
 	overlapBox := s.Box.Overlap(s.Overlap)
 	relevantAreas := make([]*Area, 0, 512)
 	for i := range areas {
@@ -202,79 +179,126 @@ func GenerateOffline(s OfflineSettings) {
 		}
 	}
 
-	// taggedNodes collects OSM node IDs that carry hazard-relevant tags.
-	// nodeCoords is a compact sorted slice used to resolve way-node coordinates.
+	// ── Pass 1: collect node coordinates (bbox-filtered) ────────────────────
+	// SkipWays=true means way blobs are skipped at the protobuf level (not just
+	// filtered), so pass 1 is fast. FilterNode causes memory reuse for out-of-bbox
+	// nodes inside the decoder goroutines — no heap allocation for skipped nodes.
+	slog.Info("Pass 1: collecting node coordinates")
 	taggedNodes := make(map[osm.NodeID]string)
-	nodeCoords := make([]nodeCoordEntry, 0)
-	nodeCoordsSorted := false
+	var nodeCoords []nodeCoordEntry
 
-	slog.Info("Scanning Ways")
-	for scanner.Scan() {
-		switch o := scanner.Object(); o := o.(type) {
-		case *osm.Node:
-			if !nodeCollectionBox.PosInside(m.NewPosition(o.Lat, o.Lon)) {
-				continue
-			}
-			if h := extractNodeHazard(o); h != "" {
-				taggedNodes[o.ID] = h
-			}
-			nodeCoords = append(nodeCoords, nodeCoordEntry{id: int64(o.ID), lat: float32(o.Lat), lon: float32(o.Lon)})
-		case *osm.Way:
-			if !nodeCoordsSorted {
-				sort.Slice(nodeCoords, func(i, j int) bool { return nodeCoords[i].id < nodeCoords[j].id })
-				nodeCoordsSorted = true
-			}
-			way := o
-			if len(way.Nodes) > 1 {
-				tags := way.TagMap()
-				lanes, _ := strconv.ParseUint(tags["lanes"], 10, 8)
-				tmpWay := TmpWay{
-					Nodes:            make([]TmpNode, len(way.Nodes)),
-					Name:             tags["name"],
-					Ref:              tags["ref"],
-					Hazard:           tags["hazard"],
-					MaxSpeed:         ParseMaxSpeed(tags["maxspeed"]),
-					MaxSpeedForward:  ParseMaxSpeed(tags["maxspeed:forward"]),
-					MaxSpeedBackward: ParseMaxSpeed(tags["maxspeed:backward"]),
-					MaxSpeedAdvisory: ParseMaxSpeed(tags["maxspeed:advisory"]),
-					Lanes:            uint8(lanes),
-					OneWay:           tags["oneway"] == "yes",
-				}
+	file1, err := os.Open(s.InputFile)
+	if err != nil {
+		slog.Error("could not open map pbf file", "error", err)
+		panic("failed to read maps, exiting")
+	}
+	scanner1 := osmpbf.New(context.Background(), file1, 2)
+	scanner1.SkipWays = true
+	scanner1.SkipRelations = true
+	scanner1.FilterNode = func(n *osm.Node) bool {
+		return nodeCollectionBox.PosInside(m.NewPosition(n.Lat, n.Lon))
+	}
+	for scanner1.Scan() {
+		node := scanner1.Object().(*osm.Node)
+		if h := extractNodeHazard(node); h != "" {
+			taggedNodes[node.ID] = h
+		}
+		nodeCoords = append(nodeCoords, nodeCoordEntry{
+			id:  int64(node.ID),
+			lat: float32(node.Lat),
+			lon: float32(node.Lon),
+		})
+	}
+	if err := scanner1.Err(); err != nil {
+		slog.Error("node scan error (pass 1)", "error", err)
+		panic("failed to read maps, exiting")
+	}
+	scanner1.Close()
+	file1.Close()
 
-				minLat := float32(90)
-				minLon := float32(180)
-				maxLat := float32(-90)
-				maxLon := float32(-180)
-				for i, n := range way.Nodes {
-					lat32, lon32 := lookupNodeCoord(nodeCoords, int64(n.ID))
-					if lat32 < minLat {
-						minLat = lat32
-					}
-					if lon32 < minLon {
-						minLon = lon32
-					}
-					if lat32 > maxLat {
-						maxLat = lat32
-					}
-					if lon32 > maxLon {
-						maxLon = lon32
-					}
-					tmpWay.Nodes[i].Latitude = lat32
-					tmpWay.Nodes[i].Longitude = lon32
-					tmpWay.Nodes[i].Hazard = hazardIndexFromString(taggedNodes[n.ID])
-				}
-				tmpWay.Box.MinPos = m.NewPosition(float64(minLat), float64(minLon))
-				tmpWay.Box.MaxPos = m.NewPosition(float64(maxLat), float64(maxLon))
+	sort.Slice(nodeCoords, func(i, j int) bool { return nodeCoords[i].id < nodeCoords[j].id })
+	slog.Info("Pass 1 complete", "nodes", len(nodeCoords), "taggedNodes", len(taggedNodes))
 
-				// Distribute directly to matching areas — no global buffer needed.
-				for _, area := range relevantAreas {
-					if tmpWay.Box.Overlapping(area.OverlapBox(s.Overlap)) {
-						area.Ways = append(area.Ways, tmpWay)
-					}
-				}
+	// ── Pass 2: scan ways, FilterWay skips out-of-bbox ways ─────────────────
+	// FilterWay runs inside decoder goroutines BEFORE osm.Way heap allocation.
+	// When it returns false the library reuses the struct — no alloc.
+	// This is the critical fix for the 14 GB OOM: the SA PBF has ~5 M ways and
+	// all of them were being allocated before any bbox filtering could happen.
+	slog.Info("Pass 2: scanning ways")
+	file2, err := os.Open(s.InputFile)
+	if err != nil {
+		slog.Error("could not open map pbf file (pass 2)", "error", err)
+		panic("failed to read maps, exiting")
+	}
+	scanner2 := osmpbf.New(context.Background(), file2, 2)
+	scanner2.SkipNodes = true
+	scanner2.SkipRelations = true
+	scanner2.FilterWay = func(w *osm.Way) bool {
+		for _, n := range w.Nodes {
+			lat, lon := lookupNodeCoord(nodeCoords, int64(n.ID))
+			if lat != 0 || lon != 0 {
+				return true
+			}
+		}
+		return false
+	}
+	for scanner2.Scan() {
+		way := scanner2.Object().(*osm.Way)
+		if len(way.Nodes) <= 1 {
+			continue
+		}
+		tags := way.TagMap()
+		lanes, _ := strconv.ParseUint(tags["lanes"], 10, 8)
+		tmpWay := TmpWay{
+			Nodes:            make([]TmpNode, len(way.Nodes)),
+			Name:             tags["name"],
+			Ref:              tags["ref"],
+			Hazard:           tags["hazard"],
+			MaxSpeed:         ParseMaxSpeed(tags["maxspeed"]),
+			MaxSpeedForward:  ParseMaxSpeed(tags["maxspeed:forward"]),
+			MaxSpeedBackward: ParseMaxSpeed(tags["maxspeed:backward"]),
+			MaxSpeedAdvisory: ParseMaxSpeed(tags["maxspeed:advisory"]),
+			Lanes:            uint8(lanes),
+			OneWay:           tags["oneway"] == "yes",
+		}
+
+		minLat := float32(90)
+		minLon := float32(180)
+		maxLat := float32(-90)
+		maxLon := float32(-180)
+		for i, n := range way.Nodes {
+			lat32, lon32 := lookupNodeCoord(nodeCoords, int64(n.ID))
+			if lat32 < minLat {
+				minLat = lat32
+			}
+			if lon32 < minLon {
+				minLon = lon32
+			}
+			if lat32 > maxLat {
+				maxLat = lat32
+			}
+			if lon32 > maxLon {
+				maxLon = lon32
+			}
+			tmpWay.Nodes[i].Latitude = lat32
+			tmpWay.Nodes[i].Longitude = lon32
+			tmpWay.Nodes[i].Hazard = hazardIndexFromString(taggedNodes[n.ID])
+		}
+		tmpWay.Box.MinPos = m.NewPosition(float64(minLat), float64(minLon))
+		tmpWay.Box.MaxPos = m.NewPosition(float64(maxLat), float64(maxLon))
+
+		for _, area := range relevantAreas {
+			if tmpWay.Box.Overlapping(area.OverlapBox(s.Overlap)) {
+				area.Ways = append(area.Ways, tmpWay)
 			}
 		}
 	}
+	if err := scanner2.Err(); err != nil {
+		slog.Error("way scan error (pass 2)", "error", err)
+		panic("failed to read maps, exiting")
+	}
+	scanner2.Close()
+	file2.Close()
 
 	nodeCoords = nil // free node coordinate cache before write phase
 

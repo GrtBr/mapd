@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -185,6 +186,7 @@ func GenerateOffline(s OfflineSettings) {
 	// nodes inside the decoder goroutines — no heap allocation for skipped nodes.
 	slog.Info("Pass 1: collecting node coordinates")
 	taggedNodes := make(map[osm.NodeID]string)
+	hazardGrid  := make(map[hazardCellKey][]hazardPosEntry)
 	var nodeCoords []nodeCoordEntry
 
 	file1, err := os.Open(s.InputFile)
@@ -202,6 +204,16 @@ func GenerateOffline(s OfflineSettings) {
 		node := scanner1.Object().(*osm.Node)
 		if h := extractNodeHazard(node); h != "" {
 			taggedNodes[node.ID] = h
+			// Also add to spatial grid for proximity matching of standalone hazard
+			// nodes (e.g. highway=stop) that are never referenced by road ways.
+			hi := hazardIndexFromString(h)
+			key := hazardCellKey{
+				lat: int32(float64(node.Lat) / hazardGridCell),
+				lon: int32(float64(node.Lon) / hazardGridCell),
+			}
+			hazardGrid[key] = append(hazardGrid[key], hazardPosEntry{
+				lat: float32(node.Lat), lon: float32(node.Lon), hazard: hi,
+			})
 		}
 		nodeCoords = append(nodeCoords, nodeCoordEntry{
 			id:  int64(node.ID),
@@ -286,6 +298,26 @@ func GenerateOffline(s OfflineSettings) {
 		}
 		tmpWay.Box.MinPos = m.NewPosition(float64(minLat), float64(minLon))
 		tmpWay.Box.MaxPos = m.NewPosition(float64(maxLat), float64(maxLon))
+
+		// Proximity fallback for the first and last nodes of each way.
+		// Stop-sign nodes (highway=stop) are standalone OSM objects that are never
+		// members of road ways, so the exact ID match above always returns hazardNone
+		// for them.  Search for the nearest hazard node within hazardProximityM metres
+		// and snap it to the endpoint if found.  Only endpoints matter because the
+		// runtime's NodeHazardAtJunction reads nodes[0] (forward) or nodes[last]
+		// (reverse) — mid-road nodes are never consulted for junction hazards.
+		if n := len(tmpWay.Nodes); n > 0 {
+			first := &tmpWay.Nodes[0]
+			if first.Hazard == hazardNone {
+				first.Hazard = nearbyHazard(hazardGrid, first.Latitude, first.Longitude)
+			}
+			if n > 1 {
+				last := &tmpWay.Nodes[n-1]
+				if last.Hazard == hazardNone {
+					last.Hazard = nearbyHazard(hazardGrid, last.Latitude, last.Longitude)
+				}
+			}
+		}
 
 		for _, area := range relevantAreas {
 			if tmpWay.Box.Overlapping(area.OverlapBox(s.Overlap)) {
@@ -486,6 +518,43 @@ func lookupNodeCoord(coords []nodeCoordEntry, id int64) (float32, float32) {
 		return coords[idx].lat, coords[idx].lon
 	}
 	return 0, 0
+}
+
+// hazardCellKey indexes a 0.001° (~111 m) grid cell for the proximity index.
+type hazardCellKey struct{ lat, lon int32 }
+
+// hazardPosEntry stores the position and hazard type of a standalone hazard node.
+type hazardPosEntry struct {
+	lat, lon float32
+	hazard   hazardIndex
+}
+
+const hazardGridCell = 0.001 // degrees per grid cell (~111 m)
+const hazardProximityM = 30.0 // max snap distance in metres
+
+// nearbyHazard searches the 3×3 cell neighbourhood around (lat, lon) and returns
+// the hazardIndex of the closest hazard node within hazardProximityM metres.
+// Returns hazardNone if nothing is within threshold.
+func nearbyHazard(grid map[hazardCellKey][]hazardPosEntry, lat, lon float32) hazardIndex {
+	cy := int32(float64(lat) / hazardGridCell)
+	cx := int32(float64(lon) / hazardGridCell)
+	bestD2 := float64(hazardProximityM * hazardProximityM)
+	best := hazardNone
+	cosLat := math.Cos(float64(lat) * math.Pi / 180.0)
+	for dy := int32(-1); dy <= 1; dy++ {
+		for dx := int32(-1); dx <= 1; dx++ {
+			for _, hp := range grid[hazardCellKey{cy + dy, cx + dx}] {
+				dlat := float64(lat-hp.lat) * 111_320
+				dlon := float64(lon-hp.lon) * 111_320 * cosLat
+				d2 := dlat*dlat + dlon*dlon
+				if d2 < bestD2 {
+					bestD2 = d2
+					best = hp.hazard
+				}
+			}
+		}
+	}
+	return best
 }
 
 // extractNodeHazard returns a hazard tag string for OSM nodes that require

@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/pkg/errors"
+	"pfeifer.dev/mapd/maps"
 	m "pfeifer.dev/mapd/math"
 	ms "pfeifer.dev/mapd/settings"
 )
@@ -54,10 +55,34 @@ func smoothPositions(positions []m.Position) []m.Position {
 	return out
 }
 
+// readWayCurvatures reads the per-node stored curvature side-channel for one
+// way from the raw capnp Coordinates list. If the capnp accessor errors, it
+// returns a zero-filled slice of the same length as the parallel m.Position
+// slice — zero means "no stored κ, fall back to live compute" downstream.
+func readWayCurvatures(w maps.Way, nodeCount int) []float64 {
+	kappa := make([]float64, nodeCount)
+	rawNodes, err := w.Way.Nodes()
+	if err != nil {
+		return kappa
+	}
+	// Defensive: raw capnp length must match the wrapper's []m.Position length.
+	// If it doesn't (shouldn't happen since both come from the same capnp object),
+	// the missing entries stay 0.0 → live fallback.
+	n := rawNodes.Len()
+	if n > nodeCount {
+		n = nodeCount
+	}
+	for j := 0; j < n; j++ {
+		kappa[j] = rawNodes.At(j).Curvature()
+	}
+	return kappa
+}
+
 func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 	nodes := state.CurrentWay.Way.Nodes()
 	num_points := len(nodes)
 	all_nodes := [][]m.Position{nodes}
+	all_nodes_curvatures := [][]float64{readWayCurvatures(state.CurrentWay.Way, len(nodes))}
 	all_nodes_direction := []bool{state.CurrentWay.OnWay.IsForward}
 	for _, nextWay := range state.NextWays {
 		nwNodes := nextWay.Way.Nodes()
@@ -65,10 +90,15 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 			num_points += len(nwNodes) - 1
 		}
 		all_nodes = append(all_nodes, nwNodes)
+		all_nodes_curvatures = append(all_nodes_curvatures, readWayCurvatures(nextWay.Way, len(nwNodes)))
 		all_nodes_direction = append(all_nodes_direction, nextWay.IsForward)
 	}
 
+	// positions and storedKappa are built in lockstep — one index, one OSM node.
+	// storedKappa[i] > 0 means the tile contained a precomputed κ for positions[i]
+	// (Phase 1 precompute, Decision 3). storedKappa[i] == 0 → live-fallback.
 	positions := make([]m.Position, num_points)
+	storedKappa := make([]float64, num_points)
 
 	all_nodes_idx := 0
 	nodes_idx := 0
@@ -87,6 +117,7 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 			}
 		}
 		positions[i] = all_nodes[all_nodes_idx][index]
+		storedKappa[i] = all_nodes_curvatures[all_nodes_idx][index]
 
 		nodes_idx += 1
 		if nodes_idx == len(all_nodes[all_nodes_idx]) || (nodes_idx == len(all_nodes[all_nodes_idx])-1 && all_nodes_idx > 0) {
@@ -95,10 +126,27 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 		}
 	}
 
+	if len(positions) != len(storedKappa) {
+		return []m.Curvature{}, fmt.Errorf("storedKappa/positions length mismatch: pos=%d kap=%d", len(positions), len(storedKappa))
+	}
+
 	// L⁴-weighted multi-scale curvature — see GetCurvatures for details.
 	curvatures, err := GetCurvatures(positions)
 	if err != nil {
 		return []m.Curvature{}, errors.Wrap(err, "could not get curvatures from points")
+	}
+
+	// Prefer stored κ over live where present. curvatures[i].KIdx is the
+	// original k-index from GetCurvatures' loop — robust against silent
+	// filtering (e.g. all triplet widths exceeded maxChordSpacing for some
+	// k, so that entry was never appended). Mirrors Phase 1 Bug B fix on
+	// the Python side. Override Curvature only — keep Pos / ArcLength /
+	// Angle from the live pipeline (they're geometry-derived).
+	for i := range curvatures {
+		k := curvatures[i].KIdx
+		if k >= 0 && k < len(storedKappa) && storedKappa[k] > 0 {
+			curvatures[i].Curvature = storedKappa[k]
+		}
 	}
 
 	average_curvatures, err := GetAverageCurvatures(curvatures)
@@ -155,6 +203,10 @@ func GetAverageCurvatures(curvatures []m.Curvature) (average_curvatures []m.Curv
 		avg.Curvature = (a*al + b*bl + c*cl) / (al + bl + cl)
 		avg.ArcLength = (curvatures[i].ArcLength + curvatures[i+1].ArcLength + curvatures[i+2].ArcLength) / 3
 		avg.Angle = (curvatures[i].Angle + curvatures[i+1].Angle + curvatures[i+2].Angle) / 3
+		// Thread KIdx from the centred (middle) triplet entry — same convention
+		// as Pos. Lets downstream code map the averaged entry back to its
+		// original position in GetStateCurvatures' positions slice.
+		avg.KIdx = curvatures[i+1].KIdx
 		average_curvatures[i] = avg
 	}
 
@@ -198,6 +250,11 @@ func GetCurvatures(positions []m.Position) (curvatures []m.Curvature, err error)
 		}
 		if totalWeight > 0 {
 			base.Curvature = totalCurv / totalWeight
+			// KIdx carries the original k-index so downstream code can map
+			// curvatures[i] back to positions[KIdx] even when this loop
+			// silently skipped k's whose all-widths chord exceeded
+			// maxChordSpacing.
+			base.KIdx = k
 			curvatures = append(curvatures, base)
 		}
 	}

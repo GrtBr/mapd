@@ -7,6 +7,14 @@ import (
 type Curvature struct {
 	Curvature, ArcLength, Angle float64
 	Pos                         Position
+	// KIdx is the surviving original k-index from GetCurvatures' loop.
+	// It lets downstream code map a Curvature entry back to its position
+	// in the input slice even when GetCurvatures silently filtered some k
+	// (e.g. all triplet widths exceeded maxChordSpacing). Zero is a valid
+	// k-index, so callers must set it explicitly — CalculateCurvature
+	// returns KIdx=0 (zero-init); GetCurvatures overwrites it before
+	// appending.
+	KIdx int
 }
 
 func CalculateCurvature(a Position, b Position, c Position) Curvature {

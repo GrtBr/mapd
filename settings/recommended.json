@@ -24,7 +24,7 @@
   "target_speed_accel": 1.2,
   "target_speed_time_offset": 1.5,
   "default_lane_width": 3.7,
-  "map_curve_target_lat_a": 2,
+  "map_curve_target_lat_a": 2.5,
   "slow_down_for_next_speed_limit": true,
   "speed_up_for_next_speed_limit": true,
   "hold_speed_limit_while_changing_set_speed": true

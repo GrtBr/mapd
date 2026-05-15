@@ -24,6 +24,7 @@ struct Coordinates {
   latitude @0 :Float64;
   longitude @1 :Float64;
   hazard    @2 :Text;
+  curvature @3 :Float64;
 }
 
 struct Offline {

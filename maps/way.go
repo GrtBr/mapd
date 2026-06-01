@@ -87,6 +87,7 @@ type Way struct {
 	oneWay           u.Curry[bool]
 	wayName          u.Curry[string]
 	wayRef           u.Curry[string]
+	wayHighway       u.Curry[string]
 	maxSpeed         u.Curry[float64]
 	box              u.Curry[m.Box]
 	nodes            u.Curry[[]m.Position]
@@ -180,6 +181,22 @@ func (w *Way) _wayRef() string {
 
 func (w *Way) WayRef() string {
 	return w.wayRef.Value(w._wayRef)
+}
+
+func (w *Way) _highway() string {
+	hw, err := w.Way.Highway()
+	if err != nil {
+		hw = ""
+	}
+	return hw
+}
+
+// Highway returns the OSM highway tag stored on the tile (motorway, residential,
+// motorway_link, …). Empty string when the tile predates the highway @14 field
+// or the capnp read errored. Used by the live curvature pipeline to pick the
+// per-class Gaussian σ so the live fallback matches the offline chain pipeline.
+func (w *Way) Highway() string {
+	return w.wayHighway.Value(w._highway)
 }
 
 func (w *Way) _maxSpeed() float64 {

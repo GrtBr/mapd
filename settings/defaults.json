@@ -22,7 +22,7 @@
   "hold_last_seen_speed_limit": false,
   "target_speed_jerk": 0.6,
   "target_speed_accel": 1.2,
-  "target_speed_time_offset": 1.5,
+  "target_speed_time_offset": 4.0,
   "default_lane_width": 3.7,
   "map_curve_target_lat_a": 2.5,
   "slow_down_for_next_speed_limit": true,

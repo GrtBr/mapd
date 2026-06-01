@@ -20,18 +20,50 @@ const maxChordSpacing float32 = 150.0
 // Widths 1, 2, 3 are tried; each contributes weight = chord⁴.
 const maxTripletWidth int = 3
 
-// gaussSigma is the arc-length standard deviation (metres) of the Gaussian
-// kernel used to pre-smooth OSM node positions before curvature computation.
-// σ=10 m: suppresses isolated displaced nodes (they contribute ~1/5 of error
-// among neighbours at 20 m spacing) while preserving tight curves (r≥30 m
-// loses <10% curvature vs 41% at σ=25 m).
-const gaussSigma float64 = 10.0
+// Per-highway Gaussian σ (metres of arc-length). Mirrors generate_tiles_ver2.py's
+// _sigma_for_highway so the LIVE fallback uses the same smoothing radius as the
+// stored κ on the same way. Without this match, κ jumps at every node where the
+// runtime falls back from stored to live because the smoothing widths differ.
+//
+//   sigmaLow  (15 m) — residential / unclassified: sparser OSM nodes (~20–30 m
+//             spacing) with genuinely tight geometry to preserve.
+//   sigmaHigh (30 m) — motorway / trunk / primary / secondary / tertiary family
+//             (and links, living_street, road, service): densely traced
+//             (~10 m spacing), needs heavier smoothing to suppress hand-tracing
+//             noise while real curves stay above r ≥ ~60 m.
+//
+// gaussSigma is kept as a legacy fallback name (used only when a way's highway
+// tag is missing or the tile predates the highway @14 field).
+const sigmaLow float64 = 15.0
+const sigmaHigh float64 = 30.0
+const gaussSigma float64 = sigmaLow // fallback when highway tag is absent
+
+// sigmaForHighway returns the smoothing σ for a way of OSM highway tag `hw`.
+// Mirrors the Python helper of the same name in generate_tiles_ver2.py.
+func sigmaForHighway(hw string) float64 {
+	switch hw {
+	case "residential", "unclassified":
+		return sigmaLow
+	}
+	if hw == "" {
+		return gaussSigma
+	}
+	return sigmaHigh
+}
+
+// tilesOnlyDebug — TEMPORARY DEBUG FLAG. When true, GetStateCurvatures uses
+// ONLY the precomputed tile curvature: storedKappa is assigned at every node
+// (including 0), so the live GetCurvatures fallback is fully discarded. Lets
+// on-road behaviour faithfully reflect the deployed tile set while debugging
+// tile quality. Set back to false (and rebuild) when finished.
+const tilesOnlyDebug = false
 
 // smoothPositions returns a new slice where each position is replaced by a
 // Gaussian-weighted centroid of all positions in the way, with weights
-// decaying by arc-length distance from that node (σ=gaussSigma).
-// This suppresses isolated OSM node positioning errors before curvature is computed.
-func smoothPositions(positions []m.Position) []m.Position {
+// decaying by arc-length distance from that node (standard deviation `sigma`).
+// This suppresses isolated OSM node positioning errors before curvature is
+// computed. `sigma` is per-highway (see sigmaForHighway).
+func smoothPositions(positions []m.Position, sigma float64) []m.Position {
 	n := len(positions)
 	out := make([]m.Position, n)
 
@@ -40,7 +72,7 @@ func smoothPositions(positions []m.Position) []m.Position {
 		arcLen[i] = arcLen[i-1] + float64(positions[i-1].DistanceTo(positions[i]))
 	}
 
-	inv2sig2 := 1.0 / (2.0 * gaussSigma * gaussSigma)
+	inv2sig2 := 1.0 / (2.0 * sigma * sigma)
 	for k := 0; k < n; k++ {
 		var wLat, wLon, wSum float64
 		for i := 0; i < n; i++ {
@@ -84,6 +116,7 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 	all_nodes := [][]m.Position{nodes}
 	all_nodes_curvatures := [][]float64{readWayCurvatures(state.CurrentWay.Way, len(nodes))}
 	all_nodes_direction := []bool{state.CurrentWay.OnWay.IsForward}
+	all_nodes_sigma := []float64{sigmaForHighway(state.CurrentWay.Way.Highway())}
 	for _, nextWay := range state.NextWays {
 		nwNodes := nextWay.Way.Nodes()
 		if len(nwNodes) > 0 {
@@ -92,13 +125,18 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 		all_nodes = append(all_nodes, nwNodes)
 		all_nodes_curvatures = append(all_nodes_curvatures, readWayCurvatures(nextWay.Way, len(nwNodes)))
 		all_nodes_direction = append(all_nodes_direction, nextWay.IsForward)
+		all_nodes_sigma = append(all_nodes_sigma, sigmaForHighway(nextWay.Way.Highway()))
 	}
 
 	// positions and storedKappa are built in lockstep — one index, one OSM node.
-	// storedKappa[i] > 0 means the tile contained a precomputed κ for positions[i]
-	// (Phase 1 precompute, Decision 3). storedKappa[i] == 0 → live-fallback.
+	// way_starts[k] records the offset in positions[] at which way k starts
+	// contributing nodes (after the shared-junction dedup that the loop below
+	// applies). way_starts has length len(all_nodes)+1; the trailing entry is
+	// num_points so per-way slicing is uniform.
 	positions := make([]m.Position, num_points)
 	storedKappa := make([]float64, num_points)
+	way_starts := make([]int, len(all_nodes)+1)
+	way_starts[0] = 0
 
 	all_nodes_idx := 0
 	nodes_idx := 0
@@ -123,37 +161,66 @@ func GetStateCurvatures(state *State) ([]m.Curvature, error) {
 		if nodes_idx == len(all_nodes[all_nodes_idx]) || (nodes_idx == len(all_nodes[all_nodes_idx])-1 && all_nodes_idx > 0) {
 			all_nodes_idx += 1
 			nodes_idx = 0
+			if all_nodes_idx < len(all_nodes) {
+				way_starts[all_nodes_idx] = i + 1
+			}
 		}
 	}
+	way_starts[len(all_nodes)] = num_points
 
 	if len(positions) != len(storedKappa) {
 		return []m.Curvature{}, fmt.Errorf("storedKappa/positions length mismatch: pos=%d kap=%d", len(positions), len(storedKappa))
 	}
 
-	// L⁴-weighted multi-scale curvature — see GetCurvatures for details.
-	curvatures, err := GetCurvatures(positions)
-	if err != nil {
-		return []m.Curvature{}, errors.Wrap(err, "could not get curvatures from points")
-	}
-
-	// Prefer stored κ over live where present. curvatures[i].KIdx is the
-	// original k-index from GetCurvatures' loop — robust against silent
-	// filtering (e.g. all triplet widths exceeded maxChordSpacing for some
-	// k, so that entry was never appended). Mirrors Phase 1 Bug B fix on
-	// the Python side. Override Curvature only — keep Pos / ArcLength /
-	// Angle from the live pipeline (they're geometry-derived).
-	for i := range curvatures {
-		k := curvatures[i].KIdx
-		if k >= 0 && k < len(storedKappa) && storedKappa[k] > 0 {
-			curvatures[i].Curvature = storedKappa[k]
+	// Group consecutive same-σ ways and run the full L⁴ + override + 3-pt MA
+	// pipeline once PER GROUP. Mirrors generate_tiles_ver2.py's chain model:
+	// a chain terminates at a σ-class boundary, each chain is smoothed with its
+	// own σ, and the MA window doesn't bleed across the boundary. Without this,
+	// the live fallback uses one σ for the whole CurrentWay+NextWays slice and
+	// produces κ that's inconsistent with the stored κ on either side.
+	var result []m.Curvature
+	groupStart := 0
+	for i := 1; i <= len(all_nodes); i++ {
+		// Close a group at the end OR when the next way's σ-class differs.
+		boundary := i == len(all_nodes) || all_nodes_sigma[i] != all_nodes_sigma[groupStart]
+		if !boundary {
+			continue
 		}
+		posStart := way_starts[groupStart]
+		posEnd := way_starts[i]
+		groupSigma := all_nodes_sigma[groupStart]
+
+		if posEnd-posStart >= 3 {
+			groupPositions := positions[posStart:posEnd]
+			curvs, err := GetCurvatures(groupPositions, groupSigma)
+			if err == nil {
+				// Remap local KIdx → global positions[] index, then apply the
+				// "prefer stored" override (or, in tilesOnlyDebug, assign stored
+				// unconditionally — including 0 — so the live fallback is
+				// discarded). KIdx flows through GetAverageCurvatures via the
+				// centred-triplet convention.
+				for j := range curvs {
+					localK := curvs[j].KIdx
+					globalK := localK + posStart
+					curvs[j].KIdx = globalK
+					if globalK >= 0 && globalK < len(storedKappa) {
+						if tilesOnlyDebug || storedKappa[globalK] > 0 {
+							curvs[j].Curvature = storedKappa[globalK]
+						}
+					}
+				}
+				if len(curvs) >= 3 {
+					avgCurvs, err := GetAverageCurvatures(curvs)
+					if err == nil {
+						result = append(result, avgCurvs...)
+					}
+				}
+			}
+		}
+		groupStart = i
 	}
 
-	average_curvatures, err := GetAverageCurvatures(curvatures)
-	if err != nil {
-		return []m.Curvature{}, errors.Wrap(err, "could not get average curvatures from curvatures")
-	}
-	return average_curvatures, nil
+	return result, nil
 }
 
 type Velocity struct {
@@ -222,11 +289,11 @@ func GetAverageCurvatures(curvatures []m.Curvature) (average_curvatures []m.Curv
 // dominate the blend. Genuine curves are preserved because all widths agree there.
 // The search stops at the first width whose chord exceeds maxChordSpacing, preventing
 // triplets from spanning junctions or large OSM gaps.
-func GetCurvatures(positions []m.Position) (curvatures []m.Curvature, err error) {
+func GetCurvatures(positions []m.Position, sigma float64) (curvatures []m.Curvature, err error) {
 	if len(positions) < 3 {
 		return []m.Curvature{}, errors.New(fmt.Sprintf("not enough points to calculate curvatures. len(points): %d", len(positions)))
 	}
-	positions = smoothPositions(positions)
+	positions = smoothPositions(positions, sigma)
 	curvatures = make([]m.Curvature, 0, len(positions))
 	for k := 1; k < len(positions)-1; k++ {
 		var totalWeight, totalCurv float64
